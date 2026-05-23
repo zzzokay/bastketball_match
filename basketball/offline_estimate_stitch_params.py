@@ -1,0 +1,1216 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+offline_estimate_stitch_params.py
+
+用途：
+    离线阶段使用。
+    在你已经完成“单目畸变矫正 + 双目极线矫正 remap 查找表”之后，
+    本脚本继续完成拼接参数估计：
+
+        1. 读取一组左右图片
+        2. 根据 stereo_rectify_maps_wide.npz 做 remap
+        3. 转灰度
+        4. 在灰度图上估计：
+              overlap_px       左右图重叠宽度
+              vertical_offset  右图相对于左图的垂直偏移
+        5. 生成 alpha 融合 mask
+        6. 保存 stitch_params.npz
+        7. 保存调试图片，方便人工检查
+
+重要说明：
+    1. 这个脚本不是重新标定。
+       它只使用已有的 remap 查找表做图像矫正，然后估计拼接参数。
+
+    2. 建议不要用近距离棋盘格图片估计最终 overlap。
+       棋盘格离相机近，视差大，不代表篮球场远距离场景。
+       更建议用真实篮球场画面，或者距离较远、纹理丰富的场景。
+
+    3. 本脚本默认输入图片是 capture 阶段保存的“已单目矫正图”。
+       所以默认需要加：
+           --input-already-undistorted
+
+       如果你输入的是摄像头 raw 原图，就不要加这个参数。
+
+典型用法：
+    python3 offline_estimate_stitch_params.py \
+        --map-file /home/elf/work/basketball/offline_build_stereo_rectify_maps/stereo_rectify_maps_wide.npz \
+        --left-image /home/elf/work/basketball/stereo_rectify_live_debug/live_000000_left_rect.jpg \
+        --right-image /home/elf/work/basketball/stereo_rectify_live_debug/live_000000_right_rect.jpg \
+        --output-param /home/elf/work/basketball/offline_build_stereo_rectify_maps/stitch_params.npz \
+        --output-dir /home/elf/work/basketball/offline_build_stereo_rectify_maps/stitch_param_debug \
+        --input-already-undistorted \
+        --min-overlap 700 \
+        --max-overlap 1200 \
+        --max-vertical-offset 120 \
+        --search-scale 0.35
+
+
+
+
+    python3 offline_estimate_stitch_params.py \
+    --map-file /home/elf/work/basketball/offline_build_stereo_rectify_maps/stereo_rectify_maps_wide.npz \
+    --left-image /home/elf/work/basketball/stereo_rectify_live_debug/live_000000_left_rect.jpg \
+    --right-image /home/elf/work/basketball/stereo_rectify_live_debug/live_000000_right_rect.jpg \
+    --output-param /home/elf/work/basketball/offline_build_stereo_rectify_maps/stitch_params.npz \
+    --output-dir /home/elf/work/basketball/offline_build_stereo_rectify_maps/stitch_param_debug \
+    --input-already-rectified \
+    --min-overlap 700 \
+    --max-overlap 1200 \
+    --max-vertical-offset 100 \
+    --search-scale 0.35
+        
+"""
+
+import argparse
+import os
+from typing import Tuple, Optional
+
+import cv2
+import numpy as np
+
+
+# ============================================================
+# 1. 基础工具函数
+# ============================================================
+
+def ensure_dir(path: str) -> None:
+    """创建目录。如果目录已经存在，不报错。"""
+    os.makedirs(path, exist_ok=True)
+
+
+def parse_image_size(value: np.ndarray) -> Tuple[int, int]:
+    """
+    从 npz 中解析图像尺寸。
+
+    支持：
+        [width, height]
+        [[width, height]]
+        numpy int 类型
+    """
+    flat = np.array(value).reshape(-1)
+    if flat.size < 2:
+        raise ValueError(f"image_size 格式不正确: {value}")
+    return int(flat[0]), int(flat[1])
+
+
+def resize_for_display(img: np.ndarray, scale: float) -> np.ndarray:
+    """按比例缩小图片，用于调试显示或保存预览。"""
+    if abs(scale - 1.0) < 1e-6:
+        return img
+    return cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+
+
+def bbox_from_mask(mask: np.ndarray) -> Tuple[int, int, int, int]:
+    """
+    根据有效 mask 计算包围盒。
+
+    返回：
+        x1, y1, x2, y2
+
+    注意：
+        x2 / y2 是右开区间。
+        也就是宽度 = x2 - x1，高度 = y2 - y1。
+    """
+    ys, xs = np.where(mask > 0)
+
+    if len(xs) == 0 or len(ys) == 0:
+        h, w = mask.shape[:2]
+        return 0, 0, w, h
+
+    x1 = int(xs.min())
+    x2 = int(xs.max()) + 1
+    y1 = int(ys.min())
+    y2 = int(ys.max()) + 1
+
+    return x1, y1, x2, y2
+
+
+def clip_int(v: int, low: int, high: int) -> int:
+    """把整数限制在 [low, high] 范围内。"""
+    return max(low, min(high, int(v)))
+
+
+# ============================================================
+# 2. 加载 remap 文件并执行 remap
+# ============================================================
+
+def load_map_file(map_file: str):
+    """
+    加载 stereo_rectify_maps_wide.npz。
+
+    这个文件应该由 offline_build_stereo_rectify_maps.py 生成。
+    里面一般包含两套 map：
+
+        1. raw -> rectified
+            left_rect_map1 / left_rect_map2
+            right_rect_map1 / right_rect_map2
+
+        2. undistorted -> rectified
+            left_undist_rect_map1 / left_undist_rect_map2
+            right_undist_rect_map1 / right_undist_rect_map2
+    """
+    if not os.path.exists(map_file):
+        raise RuntimeError(f"找不到 map 文件: {map_file}")
+
+    data = np.load(map_file)
+
+    if "raw_image_size" not in data.files:
+        raise RuntimeError("map 文件缺少 raw_image_size")
+
+    raw_image_size = parse_image_size(data["raw_image_size"])
+
+    if "rectified_size" in data.files:
+        rectified_size = parse_image_size(data["rectified_size"])
+    else:
+        # 兼容旧文件：根据 map 尺寸推断
+        if "left_rect_map1" not in data.files:
+            raise RuntimeError("map 文件缺少 left_rect_map1，无法推断 rectified_size")
+        rectified_size = (
+            data["left_rect_map1"].shape[1],
+            data["left_rect_map1"].shape[0],
+        )
+
+    return data, raw_image_size, rectified_size
+
+
+def select_map_keys(input_already_undistorted: bool):
+    """
+    根据输入图片类型选择 map。
+
+    input_already_undistorted=True:
+        输入是 capture 阶段保存的已单目矫正图。
+        使用 undistorted -> rectified map。
+
+    input_already_undistorted=False:
+        输入是摄像头原始图。
+        使用 raw -> rectified map。
+    """
+    if input_already_undistorted:
+        return (
+            "left_undist_rect_map1",
+            "left_undist_rect_map2",
+            "right_undist_rect_map1",
+            "right_undist_rect_map2",
+        )
+
+    return (
+        "left_rect_map1",
+        "left_rect_map2",
+        "right_rect_map1",
+        "right_rect_map2",
+    )
+
+
+def rectify_pair(
+    left_img: np.ndarray,
+    right_img: np.ndarray,
+    map_data,
+    raw_image_size: Tuple[int, int],
+    input_already_undistorted: bool,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    对左右图做 remap，并同时生成左右有效区域 mask。
+
+    有效 mask 的做法：
+        创建一张全白 mask，然后使用同样的 remap 查找表做 remap。
+        remap 后仍然为白色的位置，说明这个输出像素来自输入图有效区域。
+        黑色位置则说明是 remap 产生的无效区域。
+
+    返回：
+        left_rect
+        right_rect
+        left_valid_mask
+        right_valid_mask
+    """
+    keys = select_map_keys(input_already_undistorted)
+
+    for k in keys:
+        if k not in map_data.files:
+            raise RuntimeError(f"map 文件缺少字段: {k}")
+
+    # 如果输入尺寸和 map 记录尺寸不同，自动 resize。
+    # 但正常情况下，采集、标定、实时运行应该保持同一分辨率。
+    if (left_img.shape[1], left_img.shape[0]) != raw_image_size:
+        print("[警告] 左图尺寸与 raw_image_size 不一致，自动 resize")
+        left_img = cv2.resize(left_img, raw_image_size)
+
+    if (right_img.shape[1], right_img.shape[0]) != raw_image_size:
+        print("[警告] 右图尺寸与 raw_image_size 不一致，自动 resize")
+        right_img = cv2.resize(right_img, raw_image_size)
+
+    left_rect = cv2.remap(
+        left_img,
+        map_data[keys[0]],
+        map_data[keys[1]],
+        cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+    )
+
+    right_rect = cv2.remap(
+        right_img,
+        map_data[keys[2]],
+        map_data[keys[3]],
+        cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+    )
+
+    # 生成有效区域 mask。
+    raw_w, raw_h = raw_image_size
+    src_mask = np.full((raw_h, raw_w), 255, dtype=np.uint8)
+
+    left_valid = cv2.remap(
+        src_mask,
+        map_data[keys[0]],
+        map_data[keys[1]],
+        cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+    )
+
+    right_valid = cv2.remap(
+        src_mask,
+        map_data[keys[2]],
+        map_data[keys[3]],
+        cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+    )
+
+    left_valid = (left_valid > 0).astype(np.uint8) * 255
+    right_valid = (right_valid > 0).astype(np.uint8) * 255
+
+    return left_rect, right_rect, left_valid, right_valid
+
+
+# ============================================================
+# 3. 灰度预处理和匹配评分
+# ============================================================
+
+def preprocess_gray_for_match(gray: np.ndarray) -> np.ndarray:
+    """
+    将灰度图转换成更适合匹配的特征图。
+
+    为什么不直接用原灰度？
+        左右摄像头曝光、白平衡、亮度可能不同。
+        直接比灰度容易受亮度影响。
+
+    这里使用：
+        1. CLAHE 局部对比度增强
+        2. Sobel 梯度幅值
+
+    梯度图对亮度变化更不敏感，更适合估计 overlap / vertical_offset。
+    """
+    if gray.dtype != np.uint8:
+        gray = np.clip(gray, 0, 255).astype(np.uint8)
+
+    # 局部对比度增强，让纹理更明显。
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    eq = clahe.apply(gray)
+
+    # Sobel 梯度。
+    gx = cv2.Sobel(eq, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(eq, cv2.CV_32F, 0, 1, ksize=3)
+    mag = cv2.magnitude(gx, gy)
+
+    # 归一化到 0~255，方便后续计算。
+    mag = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX)
+
+    return mag.astype(np.float32)
+
+
+def common_y_ranges(height_l: int, height_r: int, right_shift_y: int) -> Tuple[int, int, int, int]:
+    """
+    根据 right_shift_y 计算左右图可比较的 y 区间。
+
+    right_shift_y 的定义：
+        右图在最终拼接画面中相对于左图向下移动的像素数。
+
+        right_shift_y > 0:
+            右图向下移动。
+            也就是最终画面中：
+                left[y] 对应 right[y - right_shift_y]
+
+        right_shift_y < 0:
+            右图向上移动。
+
+    返回：
+        left_y1, left_y2, right_y1, right_y2
+    """
+    dy = int(right_shift_y)
+
+    if dy >= 0:
+        left_y1 = dy
+        left_y2 = min(height_l, dy + height_r)
+        right_y1 = 0
+        right_y2 = right_y1 + (left_y2 - left_y1)
+    else:
+        left_y1 = 0
+        left_y2 = min(height_l, height_r + dy)
+        right_y1 = -dy
+        right_y2 = right_y1 + (left_y2 - left_y1)
+
+    if left_y2 <= left_y1 or right_y2 <= right_y1:
+        return 0, 0, 0, 0
+
+    return left_y1, left_y2, right_y1, right_y2
+
+
+def ncc_score(
+    left_feat: np.ndarray,
+    right_feat: np.ndarray,
+    left_mask: np.ndarray,
+    right_mask: np.ndarray,
+    left_bbox: Tuple[int, int, int, int],
+    right_bbox: Tuple[int, int, int, int],
+    overlap_px: int,
+    right_shift_y: int,
+    min_valid_ratio: float,
+    min_std: float,
+) -> float:
+    """
+    计算某个 overlap_px 和 right_shift_y 下的匹配得分。
+
+    匹配区域：
+        左图：有效区域右侧 overlap_px 宽度
+        右图：有效区域左侧 overlap_px 宽度
+
+    得分：
+        使用有效 mask 内像素做归一化互相关 NCC。
+        分数越高，说明越匹配。
+
+    返回：
+        score，越大越好。
+        如果区域无效，返回 -1e9。
+    """
+    h_l, w_l = left_feat.shape[:2]
+    h_r, w_r = right_feat.shape[:2]
+
+    lx1, ly1, lx2, ly2 = left_bbox
+    rx1, ry1, rx2, ry2 = right_bbox
+
+    left_width = lx2 - lx1
+    right_width = rx2 - rx1
+
+    if overlap_px <= 0:
+        return -1e9
+
+    if overlap_px > left_width or overlap_px > right_width:
+        return -1e9
+
+    left_x1 = lx2 - overlap_px
+    left_x2 = lx2
+
+    right_x1 = rx1
+    right_x2 = rx1 + overlap_px
+
+    if left_x1 < 0 or right_x2 > w_r:
+        return -1e9
+
+    ly_a, ly_b, ry_a, ry_b = common_y_ranges(h_l, h_r, right_shift_y)
+
+    if ly_b <= ly_a or ry_b <= ry_a:
+        return -1e9
+
+    left_roi = left_feat[ly_a:ly_b, left_x1:left_x2]
+    right_roi = right_feat[ry_a:ry_b, right_x1:right_x2]
+
+    lm = left_mask[ly_a:ly_b, left_x1:left_x2] > 0
+    rm = right_mask[ry_a:ry_b, right_x1:right_x2] > 0
+    valid = lm & rm
+
+    if left_roi.shape != right_roi.shape:
+        return -1e9
+
+    valid_ratio = float(valid.mean())
+    if valid_ratio < min_valid_ratio:
+        return -1e9
+
+    a = left_roi[valid].astype(np.float32)
+    b = right_roi[valid].astype(np.float32)
+
+    if a.size < 100:
+        return -1e9
+
+    a_mean = float(a.mean())
+    b_mean = float(b.mean())
+
+    a0 = a - a_mean
+    b0 = b - b_mean
+
+    a_std = float(a0.std())
+    b_std = float(b0.std())
+
+    # 如果纹理太少，相关性不可靠。
+    if a_std < min_std or b_std < min_std:
+        return -1e9
+
+    score = float(np.mean(a0 * b0) / (a_std * b_std + 1e-6))
+
+    return score
+
+
+# ============================================================
+# 4. 搜索 overlap_px / vertical_offset
+# ============================================================
+
+def estimate_overlap_and_vertical_offset(
+    left_rect: np.ndarray,
+    right_rect: np.ndarray,
+    left_valid: np.ndarray,
+    right_valid: np.ndarray,
+    min_overlap: int,
+    max_overlap: int,
+    max_vertical_offset: int,
+    overlap_step: int,
+    dy_step: int,
+    search_scale: float,
+    min_valid_ratio: float,
+    min_std: float,
+    refine_overlap_radius: int,
+    refine_dy_radius: int,
+) -> Tuple[int, int, float, Tuple[int, int, int, int], Tuple[int, int, int, int]]:
+    """
+    在灰度图上估计 overlap_px 和 vertical_offset。
+
+    搜索策略：
+        1. 先缩小图像做粗搜索，速度快。
+        2. 再回到原图，在粗搜索结果附近做精搜索。
+
+    返回：
+        overlap_px
+        vertical_offset
+        best_score
+        left_bbox
+        right_bbox
+    """
+    left_gray = cv2.cvtColor(left_rect, cv2.COLOR_BGR2GRAY)
+    right_gray = cv2.cvtColor(right_rect, cv2.COLOR_BGR2GRAY)
+
+    # 有效区域 bbox 用原图尺寸计算。
+    left_bbox = bbox_from_mask(left_valid)
+    right_bbox = bbox_from_mask(right_valid)
+
+    print("有效区域 bbox:")
+    print(f"  left_bbox  : {left_bbox}")
+    print(f"  right_bbox : {right_bbox}")
+
+    # 灰度预处理。
+    left_feat_full = preprocess_gray_for_match(left_gray)
+    right_feat_full = preprocess_gray_for_match(right_gray)
+
+    # -----------------------------
+    # 粗搜索：缩小图像，提高速度
+    # -----------------------------
+    scale = float(search_scale)
+    if scale <= 0 or scale > 1.0:
+        scale = 0.35
+
+    small_size_l = (
+        max(1, int(round(left_feat_full.shape[1] * scale))),
+        max(1, int(round(left_feat_full.shape[0] * scale))),
+    )
+    small_size_r = (
+        max(1, int(round(right_feat_full.shape[1] * scale))),
+        max(1, int(round(right_feat_full.shape[0] * scale))),
+    )
+
+    left_feat_s = cv2.resize(left_feat_full, small_size_l, interpolation=cv2.INTER_AREA)
+    right_feat_s = cv2.resize(right_feat_full, small_size_r, interpolation=cv2.INTER_AREA)
+
+    left_mask_s = cv2.resize(left_valid, small_size_l, interpolation=cv2.INTER_NEAREST)
+    right_mask_s = cv2.resize(right_valid, small_size_r, interpolation=cv2.INTER_NEAREST)
+
+    left_bbox_s = bbox_from_mask(left_mask_s)
+    right_bbox_s = bbox_from_mask(right_mask_s)
+
+    min_overlap_s = max(5, int(round(min_overlap * scale)))
+    max_overlap_s = int(round(max_overlap * scale))
+
+    left_width_s = left_bbox_s[2] - left_bbox_s[0]
+    right_width_s = right_bbox_s[2] - right_bbox_s[0]
+    max_overlap_s = min(max_overlap_s, left_width_s, right_width_s)
+
+    overlap_step_s = max(1, int(round(overlap_step * scale)))
+    dy_step_s = max(1, int(round(dy_step * scale)))
+    max_dy_s = int(round(max_vertical_offset * scale))
+
+    print("\n开始粗搜索:")
+    print(f"  search_scale      : {scale}")
+    print(f"  overlap range     : {min_overlap_s} ~ {max_overlap_s} px at scaled image")
+    print(f"  vertical range    : {-max_dy_s} ~ {max_dy_s} px at scaled image")
+    print(f"  overlap_step_s    : {overlap_step_s}")
+    print(f"  dy_step_s         : {dy_step_s}")
+
+    best_score = -1e9
+    best_overlap_s = min_overlap_s
+    best_dy_s = 0
+
+    for overlap_s in range(min_overlap_s, max_overlap_s + 1, overlap_step_s):
+        for dy_s in range(-max_dy_s, max_dy_s + 1, dy_step_s):
+            score = ncc_score(
+                left_feat_s,
+                right_feat_s,
+                left_mask_s,
+                right_mask_s,
+                left_bbox_s,
+                right_bbox_s,
+                overlap_s,
+                dy_s,
+                min_valid_ratio=min_valid_ratio,
+                min_std=min_std,
+            )
+
+            if score > best_score:
+                best_score = score
+                best_overlap_s = overlap_s
+                best_dy_s = dy_s
+
+    coarse_overlap = int(round(best_overlap_s / scale))
+    coarse_dy = int(round(best_dy_s / scale))
+
+    print("粗搜索结果:")
+    print(f"  overlap_px      : {coarse_overlap}")
+    print(f"  vertical_offset : {coarse_dy}")
+    print(f"  score           : {best_score:.6f}")
+
+    # -----------------------------
+    # 精搜索：回到原始尺寸，在附近搜索
+    # -----------------------------
+    fine_min_overlap = max(min_overlap, coarse_overlap - refine_overlap_radius)
+    fine_max_overlap = min(max_overlap, coarse_overlap + refine_overlap_radius)
+
+    # overlap 不能超过左右有效区域宽度。
+    left_width = left_bbox[2] - left_bbox[0]
+    right_width = right_bbox[2] - right_bbox[0]
+    fine_max_overlap = min(fine_max_overlap, left_width, right_width)
+
+    fine_min_dy = max(-max_vertical_offset, coarse_dy - refine_dy_radius)
+    fine_max_dy = min(max_vertical_offset, coarse_dy + refine_dy_radius)
+
+    print("\n开始精搜索:")
+    print(f"  overlap range  : {fine_min_overlap} ~ {fine_max_overlap}")
+    print(f"  dy range       : {fine_min_dy} ~ {fine_max_dy}")
+
+    best_score_f = -1e9
+    best_overlap = coarse_overlap
+    best_dy = coarse_dy
+
+    for overlap in range(fine_min_overlap, fine_max_overlap + 1, 1):
+        for dy in range(fine_min_dy, fine_max_dy + 1, 1):
+            score = ncc_score(
+                left_feat_full,
+                right_feat_full,
+                left_valid,
+                right_valid,
+                left_bbox,
+                right_bbox,
+                overlap,
+                dy,
+                min_valid_ratio=min_valid_ratio,
+                min_std=min_std,
+            )
+
+            if score > best_score_f:
+                best_score_f = score
+                best_overlap = overlap
+                best_dy = dy
+
+    print("精搜索结果:")
+    print(f"  overlap_px      : {best_overlap}")
+    print(f"  vertical_offset : {best_dy}")
+    print(f"  score           : {best_score_f:.6f}")
+
+    return best_overlap, best_dy, best_score_f, left_bbox, right_bbox
+
+
+# ============================================================
+# 5. 生成 alpha mask 和调试图
+# ============================================================
+
+def create_alpha_mask(height: int, overlap_px: int, blend_width: int = 80) -> np.ndarray:
+    """
+    创建水平 alpha 融合 mask。
+
+    重要：
+        overlap_px 是左右图真实重叠宽度。
+        blend_width 是真正渐变融合的宽度。
+
+    为什么要把两者分开？
+        如果整个 overlap 区域都做 alpha 融合，只要左右画面有一点视差，
+        就会在中间产生明显重影。
+
+    更推荐：
+        overlap_px   = 300~600
+        blend_width  = 30~100
+
+    alpha 的含义：
+        0 表示完全使用左图
+        1 表示完全使用右图
+
+    生成结果：
+        overlap 左侧一段：alpha=0，只用左图
+        中间 blend_width：alpha 从 0 到 1 渐变
+        overlap 右侧一段：alpha=1，只用右图
+    """
+    overlap_px = int(overlap_px)
+    blend_width = int(blend_width)
+
+    if overlap_px <= 1:
+        return np.ones((height, 1), dtype=np.float32)
+
+    blend_width = max(1, min(blend_width, overlap_px))
+
+    alpha = np.zeros((height, overlap_px), dtype=np.float32)
+
+    # 把渐变区域放在 overlap 中间。
+    blend_x1 = (overlap_px - blend_width) // 2
+    blend_x2 = blend_x1 + blend_width
+
+    # blend 之前完全用左图。
+    alpha[:, :blend_x1] = 0.0
+
+    # blend 区域渐变。
+    ramp = np.linspace(0.0, 1.0, blend_width, dtype=np.float32)
+    alpha[:, blend_x1:blend_x2] = ramp.reshape(1, -1)
+
+    # blend 之后完全用右图。
+    alpha[:, blend_x2:] = 1.0
+
+    return alpha
+
+def make_initial_stitch_preview(
+    left_rect: np.ndarray,
+    right_rect: np.ndarray,
+    left_bbox: Tuple[int, int, int, int],
+    right_bbox: Tuple[int, int, int, int],
+    overlap_px: int,
+    vertical_offset: int,
+    alpha_mask: np.ndarray,
+) -> Tuple[np.ndarray, dict]:
+    """
+    根据估计出的 overlap 和 vertical_offset 做一个初始融合预览。
+
+    这个函数只是为了调试。
+    后续实时拼接脚本也可以按照同样的 ROI 参数来实现。
+    """
+    h_l, w_l = left_rect.shape[:2]
+    h_r, w_r = right_rect.shape[:2]
+
+    lx1, ly1, lx2, ly2 = left_bbox
+    rx1, ry1, rx2, ry2 = right_bbox
+
+    # 计算左右图在垂直方向的共同有效区域。
+    left_y1, left_y2, right_y1, right_y2 = common_y_ranges(h_l, h_r, vertical_offset)
+    common_h = left_y2 - left_y1
+
+    if common_h <= 0:
+        raise RuntimeError("vertical_offset 导致左右图没有共同高度区域")
+
+    # 水平方向 ROI：
+    # 左图右侧 overlap_px 和右图左侧 overlap_px 融合。
+    left_keep_x1 = lx1
+    left_keep_x2 = lx2 - overlap_px
+
+    left_overlap_x1 = lx2 - overlap_px
+    left_overlap_x2 = lx2
+
+    right_overlap_x1 = rx1
+    right_overlap_x2 = rx1 + overlap_px
+
+    right_keep_x1 = rx1 + overlap_px
+    right_keep_x2 = rx2
+
+    if left_keep_x2 < left_keep_x1:
+        raise RuntimeError("overlap_px 太大，左图非重叠区域为负")
+    if right_keep_x2 < right_keep_x1:
+        raise RuntimeError("overlap_px 太大，右图非重叠区域为负")
+
+    # 裁剪各区域。
+    left_keep = left_rect[left_y1:left_y2, left_keep_x1:left_keep_x2]
+    left_overlap = left_rect[left_y1:left_y2, left_overlap_x1:left_overlap_x2]
+    right_overlap = right_rect[right_y1:right_y2, right_overlap_x1:right_overlap_x2]
+    right_keep = right_rect[right_y1:right_y2, right_keep_x1:right_keep_x2]
+
+    # alpha mask 需要和实际 common_h / overlap_px 匹配。
+    alpha = alpha_mask
+    if alpha.shape[0] != common_h or alpha.shape[1] != overlap_px:
+        alpha = create_alpha_mask(common_h, overlap_px)
+
+    alpha3 = alpha[:, :, None]
+
+    blended = (
+        left_overlap.astype(np.float32) * (1.0 - alpha3)
+        + right_overlap.astype(np.float32) * alpha3
+    )
+    blended = np.clip(blended, 0, 255).astype(np.uint8)
+
+    stitched = np.hstack([left_keep, blended, right_keep])
+
+    params = {
+        "left_y1": left_y1,
+        "left_y2": left_y2,
+        "right_y1": right_y1,
+        "right_y2": right_y2,
+        "common_h": common_h,
+
+        "left_keep_x1": left_keep_x1,
+        "left_keep_x2": left_keep_x2,
+        "left_overlap_x1": left_overlap_x1,
+        "left_overlap_x2": left_overlap_x2,
+
+        "right_overlap_x1": right_overlap_x1,
+        "right_overlap_x2": right_overlap_x2,
+        "right_keep_x1": right_keep_x1,
+        "right_keep_x2": right_keep_x2,
+
+        "output_width": stitched.shape[1],
+        "output_height": stitched.shape[0],
+    }
+
+    return stitched, params
+
+
+def draw_debug_rois(
+    left_rect: np.ndarray,
+    right_rect: np.ndarray,
+    left_bbox: Tuple[int, int, int, int],
+    right_bbox: Tuple[int, int, int, int],
+    overlap_px: int,
+    vertical_offset: int,
+    epiline_step: int,
+) -> np.ndarray:
+    """
+    生成调试图：
+        1. 左右 rectified 图左右拼接显示
+        2. 画水平参考线
+        3. 画左右图用于匹配的 overlap 区域
+    """
+    left_show = left_rect.copy()
+    right_show = right_rect.copy()
+
+    lx1, ly1, lx2, ly2 = left_bbox
+    rx1, ry1, rx2, ry2 = right_bbox
+
+    # overlap 区域。
+    lox1 = lx2 - overlap_px
+    lox2 = lx2
+    rox1 = rx1
+    rox2 = rx1 + overlap_px
+
+    # 画有效 bbox。
+    cv2.rectangle(left_show, (lx1, ly1), (lx2 - 1, ly2 - 1), (255, 0, 0), 2)
+    cv2.rectangle(right_show, (rx1, ry1), (rx2 - 1, ry2 - 1), (255, 0, 0), 2)
+
+    # 画匹配 overlap 区域。
+    cv2.rectangle(left_show, (lox1, 0), (lox2 - 1, left_show.shape[0] - 1), (0, 0, 255), 2)
+    cv2.rectangle(right_show, (rox1, 0), (rox2 - 1, right_show.shape[0] - 1), (0, 0, 255), 2)
+
+    h = min(left_show.shape[0], right_show.shape[0])
+    wide = np.hstack([left_show[:h], right_show[:h]])
+
+    # 画水平参考线。
+    for y in range(0, h, max(1, epiline_step)):
+        cv2.line(wide, (0, y), (wide.shape[1], y), (0, 255, 255), 1)
+
+    # 中间分界线。
+    cv2.line(wide, (left_show.shape[1], 0), (left_show.shape[1], h), (255, 255, 255), 2)
+
+    text = f"overlap={overlap_px}px, vertical_offset={vertical_offset}px"
+    cv2.putText(
+        wide,
+        text,
+        (30, 45),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.0,
+        (0, 255, 0),
+        2,
+    )
+
+    return wide
+
+
+# ============================================================
+# 6. 主流程
+# ============================================================
+
+def run(args: argparse.Namespace) -> None:
+    ensure_dir(args.output_dir)
+
+    map_data, raw_image_size, rectified_size = load_map_file(args.map_file)
+
+    print("加载 map 文件:")
+    print(f"  map_file       : {args.map_file}")
+    print(f"  raw_image_size : {raw_image_size}")
+    print(f"  rectified_size : {rectified_size}")
+    print(f"  input_already_undistorted : {args.input_already_undistorted}")
+
+    left_img = cv2.imread(args.left_image)
+    right_img = cv2.imread(args.right_image)
+
+    if left_img is None:
+        raise RuntimeError(f"左图读取失败: {args.left_image}")
+    if right_img is None:
+        raise RuntimeError(f"右图读取失败: {args.right_image}")
+
+    print("\n读取输入图片:")
+    print(f"  left_image  : {args.left_image}")
+    print(f"  right_image : {args.right_image}")
+    print(f"  left shape  : {left_img.shape}")
+    print(f"  right shape : {right_img.shape}")
+
+    # remap 到 rectified 图。
+    #
+    # 三种输入情况：
+    #   1. raw 原图：
+    #        不加 --input-already-undistorted
+    #        不加 --input-already-rectified
+    #
+    #   2. 已单目矫正图：
+    #        加 --input-already-undistorted
+    #
+    #   3. 已经是 rectified 图，例如 live_000000_left_rect.jpg：
+    #        加 --input-already-rectified
+    #        这时不能再 remap，否则会重复矫正，导致 overlap / vertical_offset 错误。
+    if args.input_already_rectified:
+        if args.input_already_undistorted:
+            print("[警告] 同时指定了 --input-already-undistorted 和 --input-already-rectified。")
+            print("       当前按 --input-already-rectified 处理，跳过 remap。")
+
+        left_rect = left_img.copy()
+        right_rect = right_img.copy()
+
+        if left_rect.shape[:2] != right_rect.shape[:2]:
+            raise RuntimeError("已 rectified 输入要求左右图尺寸一致")
+
+        h, w = left_rect.shape[:2]
+        left_valid = np.full((h, w), 255, dtype=np.uint8)
+        right_valid = np.full((h, w), 255, dtype=np.uint8)
+
+        rectified_size = (w, h)
+
+        print("\n输入已经是 rectified 图：跳过 remap")
+        print(f"  rectified_size : {rectified_size}")
+    else:
+        left_rect, right_rect, left_valid, right_valid = rectify_pair(
+            left_img,
+            right_img,
+            map_data,
+            raw_image_size,
+            args.input_already_undistorted,
+        )
+
+    # 保存 remap 后的左右图，方便检查。
+    cv2.imwrite(os.path.join(args.output_dir, "left_rect.jpg"), left_rect)
+    cv2.imwrite(os.path.join(args.output_dir, "right_rect.jpg"), right_rect)
+    cv2.imwrite(os.path.join(args.output_dir, "left_valid_mask.png"), left_valid)
+    cv2.imwrite(os.path.join(args.output_dir, "right_valid_mask.png"), right_valid)
+
+    # 估计 overlap 和 vertical_offset。
+    overlap_px, vertical_offset, score, left_bbox, right_bbox = estimate_overlap_and_vertical_offset(
+        left_rect=left_rect,
+        right_rect=right_rect,
+        left_valid=left_valid,
+        right_valid=right_valid,
+        min_overlap=args.min_overlap,
+        max_overlap=args.max_overlap,
+        max_vertical_offset=args.max_vertical_offset,
+        overlap_step=args.overlap_step,
+        dy_step=args.dy_step,
+        search_scale=args.search_scale,
+        min_valid_ratio=args.min_valid_ratio,
+        min_std=args.min_std,
+        refine_overlap_radius=args.refine_overlap_radius,
+        refine_dy_radius=args.refine_dy_radius,
+    )
+
+    # 如果用户手动指定 overlap / vertical_offset，则覆盖自动估计值。
+    # 这对于消除轻微重影很有用：可以手动微调 dy 或 seam 位置。
+    if args.manual_overlap > 0:
+        print(f"\n手动覆盖 overlap_px: {overlap_px} -> {args.manual_overlap}")
+        overlap_px = int(args.manual_overlap)
+
+    if args.manual_vertical_offset != 1000000:
+        print(f"手动覆盖 vertical_offset: {vertical_offset} -> {args.manual_vertical_offset}")
+        vertical_offset = int(args.manual_vertical_offset)
+
+    # 根据 vertical_offset 计算共同高度。
+    h_l, _ = left_rect.shape[:2]
+    h_r, _ = right_rect.shape[:2]
+    left_y1, left_y2, right_y1, right_y2 = common_y_ranges(h_l, h_r, vertical_offset)
+    common_h = left_y2 - left_y1
+
+    if common_h <= 0:
+        raise RuntimeError("估计出的 vertical_offset 无效，左右图没有共同高度")
+
+    # 生成 alpha mask。
+    # 注意：overlap_px 是重叠宽度，blend_width 才是真正渐变融合宽度。
+    alpha_mask = create_alpha_mask(common_h, overlap_px, args.blend_width)
+
+    # 生成初始拼接预览，并得到 ROI 参数。
+    stitched_preview, roi_params = make_initial_stitch_preview(
+        left_rect,
+        right_rect,
+        left_bbox,
+        right_bbox,
+        overlap_px,
+        vertical_offset,
+        alpha_mask,
+    )
+
+    # 保存调试图。
+    cv2.imwrite(os.path.join(args.output_dir, "stitched_preview.jpg"), stitched_preview)
+
+    debug_rois = draw_debug_rois(
+        left_rect,
+        right_rect,
+        left_bbox,
+        right_bbox,
+        overlap_px,
+        vertical_offset,
+        args.epiline_step,
+    )
+    cv2.imwrite(os.path.join(args.output_dir, "debug_rois.jpg"), debug_rois)
+
+    # 保存 alpha mask 可视化图。
+    alpha_vis = np.clip(alpha_mask * 255.0, 0, 255).astype(np.uint8)
+    cv2.imwrite(os.path.join(args.output_dir, "alpha_mask.png"), alpha_vis)
+
+    # 保存所有离线参数。
+    ensure_dir(os.path.dirname(args.output_param) or ".")
+
+    np.savez_compressed(
+        args.output_param,
+
+        # 文件来源
+        map_file=np.array(args.map_file),
+        left_image=np.array(args.left_image),
+        right_image=np.array(args.right_image),
+        input_already_undistorted=np.array(1 if args.input_already_undistorted else 0, dtype=np.int32),
+        input_already_rectified=np.array(1 if args.input_already_rectified else 0, dtype=np.int32),
+
+        # 尺寸
+        raw_image_size=np.array(raw_image_size, dtype=np.int32),
+        rectified_size=np.array(rectified_size, dtype=np.int32),
+
+        # 核心拼接参数
+        overlap_px=np.array(overlap_px, dtype=np.int32),
+        vertical_offset=np.array(vertical_offset, dtype=np.int32),
+        match_score=np.array(score, dtype=np.float32),
+
+        # 有效区域
+        left_bbox=np.array(left_bbox, dtype=np.int32),
+        right_bbox=np.array(right_bbox, dtype=np.int32),
+
+        # 垂直 ROI
+        left_y1=np.array(roi_params["left_y1"], dtype=np.int32),
+        left_y2=np.array(roi_params["left_y2"], dtype=np.int32),
+        right_y1=np.array(roi_params["right_y1"], dtype=np.int32),
+        right_y2=np.array(roi_params["right_y2"], dtype=np.int32),
+        common_h=np.array(roi_params["common_h"], dtype=np.int32),
+
+        # 水平 ROI
+        left_keep_x1=np.array(roi_params["left_keep_x1"], dtype=np.int32),
+        left_keep_x2=np.array(roi_params["left_keep_x2"], dtype=np.int32),
+        left_overlap_x1=np.array(roi_params["left_overlap_x1"], dtype=np.int32),
+        left_overlap_x2=np.array(roi_params["left_overlap_x2"], dtype=np.int32),
+
+        right_overlap_x1=np.array(roi_params["right_overlap_x1"], dtype=np.int32),
+        right_overlap_x2=np.array(roi_params["right_overlap_x2"], dtype=np.int32),
+        right_keep_x1=np.array(roi_params["right_keep_x1"], dtype=np.int32),
+        right_keep_x2=np.array(roi_params["right_keep_x2"], dtype=np.int32),
+
+        # 输出尺寸
+        output_width=np.array(roi_params["output_width"], dtype=np.int32),
+        output_height=np.array(roi_params["output_height"], dtype=np.int32),
+
+        # alpha mask
+        blend_width=np.array(args.blend_width, dtype=np.int32),
+        alpha_mask=alpha_mask.astype(np.float32),
+
+        # 搜索参数记录
+        min_overlap=np.array(args.min_overlap, dtype=np.int32),
+        max_overlap=np.array(args.max_overlap, dtype=np.int32),
+        max_vertical_offset=np.array(args.max_vertical_offset, dtype=np.int32),
+        search_scale=np.array(args.search_scale, dtype=np.float32),
+    )
+
+    print("\n================ 估计完成 ================")
+    print(f"overlap_px       : {overlap_px}")
+    print(f"vertical_offset  : {vertical_offset}")
+    print(f"blend_width      : {args.blend_width}")
+    print(f"match_score      : {score:.6f}")
+    print(f"left_bbox        : {left_bbox}")
+    print(f"right_bbox       : {right_bbox}")
+    print(f"output size      : {roi_params['output_width']} x {roi_params['output_height']}")
+    print("")
+    print("已保存参数:")
+    print(f"  {args.output_param}")
+    print("")
+    print("已保存调试图片:")
+    print(f"  {os.path.join(args.output_dir, 'left_rect.jpg')}")
+    print(f"  {os.path.join(args.output_dir, 'right_rect.jpg')}")
+    print(f"  {os.path.join(args.output_dir, 'debug_rois.jpg')}")
+    print(f"  {os.path.join(args.output_dir, 'alpha_mask.png')}")
+    print(f"  {os.path.join(args.output_dir, 'stitched_preview.jpg')}")
+
+
+# ============================================================
+# 7. 参数解析
+# ============================================================
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Estimate overlap / vertical offset / alpha mask for stereo stitching."
+    )
+
+    parser.add_argument(
+        "--map-file",
+        required=True,
+        help="offline_build_stereo_rectify_maps.py 生成的 stereo_rectify_maps_wide.npz",
+    )
+
+    parser.add_argument(
+        "--left-image",
+        required=True,
+        help="用于估计拼接参数的左图",
+    )
+
+    parser.add_argument(
+        "--right-image",
+        required=True,
+        help="用于估计拼接参数的右图",
+    )
+
+    parser.add_argument(
+        "--input-already-undistorted",
+        action="store_true",
+        help="输入图片是否已经是 capture 阶段保存的单目矫正图",
+    )
+
+    parser.add_argument(
+        "--input-already-rectified",
+        action="store_true",
+        help="输入图片是否已经是双目极线矫正后的 rectified 图。如果使用 live_000000_left_rect.jpg 这类图，必须加这个参数，避免重复 remap。",
+    )
+
+    parser.add_argument(
+        "--output-param",
+        default="/home/elf/work/basketball/offline_build_stereo_rectify_maps/stitch_params.npz",
+        help="输出离线拼接参数 npz",
+    )
+
+    parser.add_argument(
+        "--output-dir",
+        default="/home/elf/work/basketball/offline_build_stereo_rectify_maps/stitch_param_debug",
+        help="调试图片输出目录",
+    )
+
+    # 搜索范围参数
+    parser.add_argument(
+        "--min-overlap",
+        type=int,
+        default=80,
+        help="最小重叠宽度，单位像素",
+    )
+
+    parser.add_argument(
+        "--max-overlap",
+        type=int,
+        default=1200,
+        help="最大重叠宽度，单位像素。不同相机视角下需要调整。",
+    )
+
+    parser.add_argument(
+        "--max-vertical-offset",
+        type=int,
+        default=120,
+        help="允许的最大上下偏移。极线矫正后一般不应太大。",
+    )
+
+    parser.add_argument(
+        "--overlap-step",
+        type=int,
+        default=8,
+        help="粗搜索 overlap 步长，单位为原图像素",
+    )
+
+    parser.add_argument(
+        "--dy-step",
+        type=int,
+        default=4,
+        help="粗搜索 vertical_offset 步长，单位为原图像素",
+    )
+
+    parser.add_argument(
+        "--search-scale",
+        type=float,
+        default=0.35,
+        help="粗搜索缩放比例。越小越快，但精度略低。",
+    )
+
+    parser.add_argument(
+        "--refine-overlap-radius",
+        type=int,
+        default=60,
+        help="精搜索时，在粗搜索 overlap 周围 ±多少像素继续搜索",
+    )
+
+    parser.add_argument(
+        "--refine-dy-radius",
+        type=int,
+        default=20,
+        help="精搜索时，在粗搜索 dy 周围 ±多少像素继续搜索",
+    )
+
+    parser.add_argument(
+        "--min-valid-ratio",
+        type=float,
+        default=0.35,
+        help="匹配区域中有效像素比例最低要求",
+    )
+
+    parser.add_argument(
+        "--min-std",
+        type=float,
+        default=3.0,
+        help="匹配区域纹理强度最低要求，太低说明区域过于平坦，不适合匹配",
+    )
+
+    parser.add_argument(
+        "--blend-width",
+        type=int,
+        default=60,
+        help="真正 alpha 渐变融合的宽度。减小它可以明显减轻重影，建议 30~100。",
+    )
+
+    parser.add_argument(
+        "--manual-overlap",
+        type=int,
+        default=0,
+        help="手动指定 overlap_px。>0 时覆盖自动估计结果。",
+    )
+
+    parser.add_argument(
+        "--manual-vertical-offset",
+        type=int,
+        default=1000000,
+        help="手动指定 vertical_offset。默认 1000000 表示不覆盖自动估计结果。",
+    )
+
+    parser.add_argument(
+        "--epiline-step",
+        type=int,
+        default=80,
+        help="调试图中水平参考线间隔",
+    )
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    run(args)
+
+
+if __name__ == "__main__":
+    main()

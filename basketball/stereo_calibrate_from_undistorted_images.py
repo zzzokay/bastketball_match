@@ -582,8 +582,10 @@ def run_stereo_calibrate(
         1e-5
     )
 
-    # 固定左右单目标定得到的内参和畸变，只优化双目外参 R、T
-    flags = cv2.CALIB_FIX_INTRINSIC
+    # 不固定内参，让 stereoCalibrate 同时优化内参和外参。
+    # 因为输入是已去畸变图片，单目标定估出的 K 本身有偏差，
+    # 固定它只调 R/T 会导致 RMS 偏高。
+    flags = 0
 
     ret_stereo, K_left_out, D_left_out, K_right_out, D_right_out, R, T, E, F = cv2.stereoCalibrate(
         object_points_all,
