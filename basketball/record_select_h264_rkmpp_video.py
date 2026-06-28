@@ -37,7 +37,7 @@ RK3588 / ELF2 多路视频录制脚本。
         --runtime-seam-x 150 \
         --runtime-blend-width 40 \
         --runtime-right-x-shift 30 \
-        --runtime-right-y-shift -5 \
+        --runtime-right-y-shift 25 \
         --display-scale 0.25
 
 重要建议：
@@ -811,19 +811,40 @@ def run(args: argparse.Namespace) -> None:
     stat_total_ms = 0.0
     stat_build_ms = 0.0
     debug_idx = 0
+    auto_record_start_time = None
+
 
     try:
         left_cam = LatestFrameCamera(cap_left, "left").start()
         right_cam = LatestFrameCamera(cap_right, "right").start()
 
         print("\n等待摄像头第一帧...")
+        first_left_raw = None
+        first_right_raw = None
+
         for _ in range(200):
-            ok, _, _ = grab_pair_latest(left_cam, right_cam)
+            ok, first_left_raw, first_right_raw = grab_pair_latest(left_cam, right_cam)
             if ok:
                 break
             time.sleep(0.01)
 
+        if first_left_raw is None or first_right_raw is None:
+            raise RuntimeError("等待摄像头第一帧超时，无法开始录制。")
+
         print_key_help()
+
+        if args.auto_left_right_raw:
+            print("\n[自动录制] 已启用 auto-raw，开始同时录制左右路 raw 画面。")
+            if not rec_left.active:
+                rec_left.start(first_left_raw)
+            if not rec_right.active:
+                rec_right.start(first_right_raw)
+            auto_record_start_time = time.time()
+
+            if args.record_seconds > 0:
+                print(f"[自动录制] 将录制 {args.record_seconds:.1f} 秒后自动退出。")
+            else:
+                print("[自动录制] 未设置 record-seconds，将一直录制到 q 或 Ctrl+C。")
 
         while True:
             loop_t0 = time.perf_counter()
@@ -861,36 +882,43 @@ def run(args: argparse.Namespace) -> None:
                     build_ms += (time.perf_counter() - t0) * 1000.0
                 return view
 
-            if args.preview == "left":
-                preview_src = left_raw
-            elif args.preview == "right":
-                preview_src = right_raw
-            elif args.preview == "wide":
-                wide, view = ensure_wide_and_view()
-                preview_src = wide
-            else:
-                if rec_wide.active:
-                    wide, view = ensure_wide_and_view()
-                else:
-                    view = ensure_view_only()
-                preview_src = view
 
-            preview = resize_for_display(preview_src, args.display_scale)
+
+
             active_names = [name for name, rec in recorders.items() if rec.active]
             active_text = ",".join(active_names) if active_names else "none"
-            text = f"REC:{active_text} | 1:left 2:right 3:wide 4:view a:all s:jpg q:quit"
-            cv2.putText(preview, text, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                        (0, 0, 255) if active_names else (0, 255, 0), 2)
 
             if not args.headless:
+                if args.preview == "left":
+                    preview_src = left_raw
+                elif args.preview == "right":
+                    preview_src = right_raw
+                elif args.preview == "wide":
+                    wide, view = ensure_wide_and_view()
+                    preview_src = wide
+                else:
+                    if rec_wide.active:
+                        wide, view = ensure_wide_and_view()
+                    else:
+                        view = ensure_view_only()
+                    preview_src = view
+
+                preview = resize_for_display(preview_src, args.display_scale)
+                text = f"REC:{active_text} | 1:left 2:right 3:wide 4:view a:all s:jpg q:quit"
+                cv2.putText(preview, text, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                            (0, 0, 255) if active_names else (0, 255, 0), 2)
+
                 cv2.imshow("record preview", preview)
                 key = cv2.waitKey(1) & 0xFF
             else:
                 key = 255
 
-            term_key = read_terminal_key()
-            if term_key != 255:
-                key = term_key
+
+
+            if not args.no_terminal_key:
+                term_key = read_terminal_key()
+                if term_key != 255:
+                    key = term_key
 
             if key in (ord("q"), 27):
                 print("退出。")
@@ -944,12 +972,14 @@ def run(args: argparse.Namespace) -> None:
             if rec_wide.active:
                 wide, view = ensure_wide_and_view()
                 rec_wide.enqueue(wide, now)
-            if rec_view.active:
-                if wide is not None:
-                    _, view = ensure_wide_and_view()
-                else:
-                    view = ensure_view_only()
-                rec_view.enqueue(view, now)
+            if (
+                args.auto_left_right_raw
+                and args.record_seconds > 0
+                and auto_record_start_time is not None
+            ):
+                if time.time() - auto_record_start_time >= args.record_seconds:
+                    print(f"\n[自动录制] 已达到 {args.record_seconds:.1f} 秒，准备退出。")
+                    break
 
             loop_t1 = time.perf_counter()
             stat_count += 1
@@ -1035,6 +1065,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--display-scale", type=float, default=0.25, help="预览窗口缩放比例")
     parser.add_argument("--headless", action="store_true", help="不显示窗口，只使用终端按键")
     parser.add_argument("--jpg-quality", type=int, default=95, help="按 s 保存调试 JPG 的质量")
+    
+    parser.add_argument(
+        "--auto-raw", "--auto-left-right-raw",
+        dest="auto_left_right_raw",
+        action="store_true",
+        help="启动并拿到第一帧后，自动同时录制 left_raw 和 right_raw"
+    )
+    parser.add_argument(
+        "--record-seconds",
+        type=float,
+        default=0.0,
+        help="自动录制时长，单位秒；0 表示一直录，直到 q 或 Ctrl+C 退出"
+    )
+    parser.add_argument(
+        "--no-terminal-key",
+        action="store_true",
+        help="禁用终端按键读取，适合无人值守运行"
+    )
+    
+    
     return parser.parse_args()
 
 

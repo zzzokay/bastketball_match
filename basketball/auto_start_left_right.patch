@@ -1,0 +1,34 @@
+*** Begin Patch
+*** Update File: record_select_h264_rkmpp_video.py
+@@
+     parser.add_argument(
+         "--mono-source",
+         choices=["rectified", "raw"],
+         default="rectified",
+         help="左/右单目保存来源：rectified=保存极线矫正后的拼接前单目图；raw=保存摄像头原图",
+     )
++
++    parser.add_argument(
++        "--auto-start-left-right",
++        action="store_true",
++        help="程序启动后自动开始录制 left/right 单目视频，不需要按 1/2",
++    )
+ 
+     parser.add_argument("--ffmpeg", default="ffmpeg", help="ffmpeg 可执行文件路径")
+     parser.add_argument("--encoder", default="h264_rkmpp", help="FFmpeg 编码器，RK3588 推荐 h264_rkmpp 或 hevc_rkmpp")
+     parser.add_argument("--container", default="mp4", help="输出容器后缀，默认 mp4")
+@@
+ 
+         print_key_help()
++
++        if args.auto_start_left_right:
++            print("\n自动开始录制左右路单目视频...")
++            if not rec_left.active:
++                rec_left.start(ensure_left_mono())
++            if not rec_right.active:
++                rec_right.start(ensure_right_mono())
+ 
+         while True:
+             loop_t0 = time.perf_counter()
+             ok, left_raw, right_raw = grab_pair_latest(left_cam, right_cam)
+*** End Patch

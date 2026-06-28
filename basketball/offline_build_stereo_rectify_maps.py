@@ -71,7 +71,7 @@ offline_build_stereo_rectify_maps.py
         --board-cols 11 \
         --board-rows 8 \
         --square-size 22 \
-        --rectify-alpha 1.0 \
+        --rectify-alpha 0 \
         --out-scale 1.15 \
         --headless
 
@@ -84,6 +84,21 @@ offline_build_stereo_rectify_maps.py
         --output-dir /home/elf/work/basketball/stereo_rectify_debug \
         --input-already-undistorted \
         --headless 
+
+典型用法四：使用生成好的 remap 表采集最终校正后的左右单张图
+    python3 offline_build_stereo_rectify_maps.py \
+        --mode capture-rectified \
+        --left-device /dev/video41 \
+        --right-device /dev/video43 \
+        --map-file /home/elf/work/basketball/offline_build_stereo_rectify_maps/stereo_rectify_maps_wide.npz \
+        --finish-rectify-dir /home/elf/work/basketball/offline_build_stereo_rectify_maps/finish_stereo_rectify \
+        --width 1920 \
+        --height 1080 \
+        --fps 30 \
+        --display-scale 0.25 \
+        --finish-crop-mode manual-lr \
+        --finish-left-manual-crop 0,0,2208,1242 \
+        --finish-right-manual-crop 0,0,2208,1242
 
 按键：
     capture 模式：
@@ -128,6 +143,7 @@ DEFAULT_RIGHT_CALIB_FILE = "/home/elf/work/basketball/camera_calib.npz"
 DEFAULT_CAPTURE_DIR = "/home/elf/work/basketball/offline_build_stereo_rectify_maps/images"
 DEFAULT_MAP_FILE = "/home/elf/work/basketball/offline_build_stereo_rectify_maps/stereo_rectify_maps_wide.npz"
 DEFAULT_OUTPUT_DIR = "/home/elf/work/basketball/offline_build_stereo_rectify_maps"
+DEFAULT_FINISH_RECTIFY_DIR = "/home/elf/work/basketball/offline_build_stereo_rectify_maps/finish_stereo_rectify"
 
 DEFAULT_WIDTH = 1920
 DEFAULT_HEIGHT = 1080
@@ -1423,6 +1439,603 @@ def rectify_pair_by_map(
     return left_rect, right_rect
 
 
+
+
+def clamp_crop_rect(rect: Tuple[int, int, int, int], image_size: Tuple[int, int]) -> Tuple[int, int, int, int]:
+    """
+    把裁切矩形限制在图像范围内。
+
+    rect 格式：
+        (x, y, w, h)
+    image_size 格式：
+        (width, height)
+
+    返回值一定不会越界；如果裁切区域无效，会返回宽高为 0 的矩形。
+    """
+    img_w, img_h = image_size
+    x, y, w, h = [int(v) for v in rect]
+
+    x1 = max(0, min(img_w, x))
+    y1 = max(0, min(img_h, y))
+    x2 = max(0, min(img_w, x + w))
+    y2 = max(0, min(img_h, y + h))
+
+    return x1, y1, max(0, x2 - x1), max(0, y2 - y1)
+
+
+def is_valid_crop_rect(rect: Tuple[int, int, int, int]) -> bool:
+    """判断裁切矩形是否有效。"""
+    return int(rect[2]) > 0 and int(rect[3]) > 0
+
+
+def shrink_crop_rect(
+    rect: Tuple[int, int, int, int],
+    margin: int,
+    image_size: Tuple[int, int],
+) -> Tuple[int, int, int, int]:
+    """
+    在有效区域基础上向内收缩 margin 像素。
+
+    为什么要有 margin：
+        stereoRectify 给出的 roi 一般已经是有效区域，但边缘附近有时仍会有 1~3 像素插值黑边。
+        设置 --finish-crop-margin 2 或 4 可以更保险地去掉边缘黑线。
+    """
+    x, y, w, h = [int(v) for v in rect]
+    m = max(0, int(margin))
+    return clamp_crop_rect((x + m, y + m, w - 2 * m, h - 2 * m), image_size)
+
+
+def intersect_crop_rect(
+    a: Tuple[int, int, int, int],
+    b: Tuple[int, int, int, int],
+) -> Tuple[int, int, int, int]:
+    """计算两个裁切矩形的交集。"""
+    ax, ay, aw, ah = [int(v) for v in a]
+    bx, by, bw, bh = [int(v) for v in b]
+
+    x1 = max(ax, bx)
+    y1 = max(ay, by)
+    x2 = min(ax + aw, bx + bw)
+    y2 = min(ay + ah, by + bh)
+
+    return x1, y1, max(0, x2 - x1), max(0, y2 - y1)
+
+
+def crop_by_rect(img: np.ndarray, rect: Tuple[int, int, int, int]) -> np.ndarray:
+    """按照 (x, y, w, h) 裁切图像。"""
+    x, y, w, h = [int(v) for v in rect]
+    return img[y:y + h, x:x + w].copy()
+
+
+def crop_map_by_rect(map_arr: np.ndarray, rect: Tuple[int, int, int, int]) -> np.ndarray:
+    """按照 (x, y, w, h) 裁切 remap 映射表。"""
+    x, y, w, h = [int(v) for v in rect]
+    return map_arr[y:y + h, x:x + w].copy()
+
+
+def get_roi_from_map_file(map_data, key: str, rectified_size: Tuple[int, int]) -> Optional[Tuple[int, int, int, int]]:
+    """
+    从 npz 里的 roi_left / roi_right 读取有效区域。
+
+    OpenCV stereoRectify 返回的 roi_left / roi_right 的含义是：
+        在校正后的输出画布中，哪一块矩形区域是相机真实像素映射过来的有效区域。
+
+    如果 roi 为 (0, 0, 0, 0)，说明 OpenCV 没能给出可靠有效矩形，后面会用 mask 自动估计作为兜底。
+    """
+    if key not in map_data.files:
+        return None
+
+    rect = tuple(int(v) for v in np.array(map_data[key]).reshape(-1)[:4])
+    rect = clamp_crop_rect(rect, rectified_size)
+    if not is_valid_crop_rect(rect):
+        return None
+    return rect
+
+
+def estimate_valid_bbox_from_remap(
+    map_data,
+    raw_image_size: Tuple[int, int],
+    side: str,
+) -> Tuple[int, int, int, int]:
+    """
+    通过 remap 一个全白 mask，自动估计校正后图像的有效像素包围框。
+
+    注意：
+        这个方法得到的是“有效像素的外接矩形”。
+        如果图像边缘是弧形，有效像素外接矩形内部仍可能包含黑角。
+        所以如果你要求绝对没有黑边，优先使用 roi 或 common-roi。
+    """
+    if side not in ("left", "right"):
+        raise ValueError("side 必须是 left 或 right")
+
+    map1_key = f"{side}_rect_map1"
+    map2_key = f"{side}_rect_map2"
+    if map1_key not in map_data.files or map2_key not in map_data.files:
+        raise RuntimeError(f"remap 文件缺少字段: {map1_key} / {map2_key}")
+
+    raw_w, raw_h = raw_image_size
+    src_mask = np.full((raw_h, raw_w), 255, dtype=np.uint8)
+    dst_mask = cv2.remap(
+        src_mask,
+        map_data[map1_key],
+        map_data[map2_key],
+        cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+
+    ys, xs = np.where(dst_mask > 0)
+    if len(xs) == 0 or len(ys) == 0:
+        return 0, 0, 0, 0
+
+    x1 = int(xs.min())
+    y1 = int(ys.min())
+    x2 = int(xs.max()) + 1
+    y2 = int(ys.max()) + 1
+    return x1, y1, x2 - x1, y2 - y1
+
+
+def parse_manual_crop_rect(value: str, rectified_size: Tuple[int, int]) -> Tuple[int, int, int, int]:
+    """
+    解析手动裁切参数。
+
+    支持格式：
+        --finish-manual-crop 913,588,611,508
+
+    含义：
+        x=913, y=588, w=611, h=508
+    """
+    parts = [p.strip() for p in str(value).replace(";", ",").split(",") if p.strip()]
+    if len(parts) != 4:
+        raise RuntimeError("--finish-manual-crop 格式错误，应为 x,y,w,h，例如 913,588,611,508")
+    rect = tuple(int(round(float(v))) for v in parts)
+    rect = clamp_crop_rect(rect, rectified_size)
+    if not is_valid_crop_rect(rect):
+        raise RuntimeError(f"--finish-manual-crop 得到无效裁切区域: {rect}")
+    return rect
+
+
+def compute_finish_crop_rects(
+    map_data,
+    raw_image_size: Tuple[int, int],
+    rectified_size: Tuple[int, int],
+    args: argparse.Namespace,
+) -> Tuple[Tuple[int, int, int, int], Tuple[int, int, int, int]]:
+    """
+    根据参数计算 capture-rectified 模式使用的左右裁切区域。
+
+    支持的模式：
+        none:
+            不裁切，保存完整 rectified 图，可能有黑边。
+
+        roi:
+            左图使用 roi_left，右图使用 roi_right。
+            这种模式保留各自最大的无黑边有效画面，但左右图尺寸和坐标原点可能不同。
+            适合单独保存左右校正图用于查看。
+
+        common-roi:
+            使用 roi_left 和 roi_right 的交集，左右图裁同一块区域。
+            优点：左右图尺寸相同，且坐标原点一致，后续脚本最不容易出错。
+            缺点：画面会比 roi 模式更小。
+
+        bbox / common-bbox:
+            从 remap mask 自动估计有效外接矩形。保留视野更多，但不保证矩形内部完全没有黑角。
+
+        manual:
+            用户手动指定同一个裁切矩形，左右图裁同一块区域。
+    """
+    mode = args.finish_crop_mode
+    full_rect = (0, 0, int(rectified_size[0]), int(rectified_size[1]))
+
+    if mode == "none":
+        return full_rect, full_rect
+
+    # 优先使用 stereoRectify 保存下来的 roi；没有 roi 或 roi 无效时，自动用 mask 估计。
+    left_roi = get_roi_from_map_file(map_data, "roi_left", rectified_size)
+    right_roi = get_roi_from_map_file(map_data, "roi_right", rectified_size)
+
+    if left_roi is None:
+        left_roi = estimate_valid_bbox_from_remap(map_data, raw_image_size, "left")
+    if right_roi is None:
+        right_roi = estimate_valid_bbox_from_remap(map_data, raw_image_size, "right")
+
+    left_roi = shrink_crop_rect(left_roi, args.finish_crop_margin, rectified_size)
+    right_roi = shrink_crop_rect(right_roi, args.finish_crop_margin, rectified_size)
+
+    if not is_valid_crop_rect(left_roi):
+        raise RuntimeError(f"左图有效裁切区域无效: {left_roi}")
+    if not is_valid_crop_rect(right_roi):
+        raise RuntimeError(f"右图有效裁切区域无效: {right_roi}")
+
+    if mode == "roi":
+        return left_roi, right_roi
+
+    if mode == "common-roi":
+        common = intersect_crop_rect(left_roi, right_roi)
+        common = shrink_crop_rect(common, 0, rectified_size)
+        if not is_valid_crop_rect(common):
+            raise RuntimeError(f"roi_left 与 roi_right 没有有效交集，不能 common-roi 裁切。left={left_roi}, right={right_roi}")
+        return common, common
+
+    if mode == "bbox":
+        left_bbox = estimate_valid_bbox_from_remap(map_data, raw_image_size, "left")
+        right_bbox = estimate_valid_bbox_from_remap(map_data, raw_image_size, "right")
+        left_bbox = shrink_crop_rect(left_bbox, args.finish_crop_margin, rectified_size)
+        right_bbox = shrink_crop_rect(right_bbox, args.finish_crop_margin, rectified_size)
+        return left_bbox, right_bbox
+
+    if mode == "common-bbox":
+        left_bbox = estimate_valid_bbox_from_remap(map_data, raw_image_size, "left")
+        right_bbox = estimate_valid_bbox_from_remap(map_data, raw_image_size, "right")
+        left_bbox = shrink_crop_rect(left_bbox, args.finish_crop_margin, rectified_size)
+        right_bbox = shrink_crop_rect(right_bbox, args.finish_crop_margin, rectified_size)
+        common = intersect_crop_rect(left_bbox, right_bbox)
+        if not is_valid_crop_rect(common):
+            raise RuntimeError(f"left/right bbox 没有有效交集，不能 common-bbox 裁切。left={left_bbox}, right={right_bbox}")
+        return common, common
+
+    if mode == "manual":
+        common = parse_manual_crop_rect(args.finish_manual_crop, rectified_size)
+        common = shrink_crop_rect(common, args.finish_crop_margin, rectified_size)
+        if not is_valid_crop_rect(common):
+            raise RuntimeError(f"手动裁切区域无效: {common}")
+        return common, common
+
+    if mode == "manual-lr":
+        if not args.finish_left_manual_crop or not args.finish_right_manual_crop:
+            raise RuntimeError(
+                "使用 --finish-crop-mode manual-lr 时，必须同时指定 "
+                "--finish-left-manual-crop 和 --finish-right-manual-crop"
+            )
+
+        left_crop = parse_manual_crop_rect(args.finish_left_manual_crop, rectified_size)
+        right_crop = parse_manual_crop_rect(args.finish_right_manual_crop, rectified_size)
+
+        left_crop = shrink_crop_rect(left_crop, args.finish_crop_margin, rectified_size)
+        right_crop = shrink_crop_rect(right_crop, args.finish_crop_margin, rectified_size)
+
+        if not is_valid_crop_rect(left_crop):
+            raise RuntimeError(f"左图手动裁切区域无效: {left_crop}")
+
+        if not is_valid_crop_rect(right_crop):
+            raise RuntimeError(f"右图手动裁切区域无效: {right_crop}")
+
+        return left_crop, right_crop
+
+    raise RuntimeError(f"未知 finish_crop_mode: {mode}")
+
+
+def save_finish_crop_params(
+    path: str,
+    original_map_file: str,
+    rectified_size: Tuple[int, int],
+    left_crop: Tuple[int, int, int, int],
+    right_crop: Tuple[int, int, int, int],
+    mode: str,
+    margin: int,
+) -> None:
+    """保存裁切参数，方便后续实时拼接或调试脚本复用。"""
+    ensure_dir(os.path.dirname(path) or ".")
+    np.savez_compressed(
+        path,
+        original_map_file=np.array(str(original_map_file)),
+        original_rectified_size=np.array(rectified_size, dtype=np.int32),
+        left_crop=np.array(left_crop, dtype=np.int32),
+        right_crop=np.array(right_crop, dtype=np.int32),
+        left_output_size=np.array((left_crop[2], left_crop[3]), dtype=np.int32),
+        right_output_size=np.array((right_crop[2], right_crop[3]), dtype=np.int32),
+        finish_crop_mode=np.array(str(mode)),
+        finish_crop_margin=np.array(int(margin), dtype=np.int32),
+    )
+
+
+def save_cropped_common_map_file(
+    src_map_data,
+    dst_map_file: str,
+    crop_rect: Tuple[int, int, int, int],
+) -> None:
+    """
+    保存一份“已经裁切过”的 remap 表。
+
+    重要限制：
+        这里要求左右图使用同一个裁切区域，也就是 common-roi / manual 这种模式。
+        这样 left_rect_map 和 right_rect_map 的尺寸仍然一致，后续原有实时脚本更容易直接使用。
+
+    处理方式：
+        对 map 表做数组切片，而不是重新计算 stereoRectify。
+        因此新 map 的输出尺寸就是裁切后的尺寸，实时 remap 后天然没有黑边。
+    """
+    ensure_dir(os.path.dirname(dst_map_file) or ".")
+    x, y, w, h = [int(v) for v in crop_rect]
+
+    out = {}
+    map_keys = {
+        "left_rect_map1", "left_rect_map2", "right_rect_map1", "right_rect_map2",
+        "left_undist_rect_map1", "left_undist_rect_map2", "right_undist_rect_map1", "right_undist_rect_map2",
+    }
+
+    for key in src_map_data.files:
+        value = src_map_data[key]
+        if key in map_keys:
+            out[key] = crop_map_by_rect(value, crop_rect)
+        elif key == "rectified_size":
+            out[key] = np.array((w, h), dtype=np.int32)
+        elif key in ("roi_left", "roi_right"):
+            out[key] = np.array((0, 0, w, h), dtype=np.int32)
+        elif key in ("P1", "P2"):
+            # 裁切后主点坐标需要减去裁切左上角偏移。
+            P = np.array(value, dtype=np.float64).copy()
+            if P.shape[0] >= 2 and P.shape[1] >= 3:
+                P[0, 2] -= x
+                P[1, 2] -= y
+            out[key] = P
+        elif key == "Q":
+            # Q 矩阵用于深度重投影。裁切会改变 cx/cy，所以这里做基础修正。
+            # 如果你只做图像拼接，不使用 Q，这部分不影响 remap。
+            Q = np.array(value, dtype=np.float64).copy()
+            if Q.shape[0] >= 2 and Q.shape[1] >= 4:
+                Q[0, 3] += x
+                Q[1, 3] += y
+            out[key] = Q
+        else:
+            out[key] = value
+
+    out["crop_rect"] = np.array(crop_rect, dtype=np.int32)
+    out["crop_x"] = np.array(x, dtype=np.int32)
+    out["crop_y"] = np.array(y, dtype=np.int32)
+    out["crop_w"] = np.array(w, dtype=np.int32)
+    out["crop_h"] = np.array(h, dtype=np.int32)
+
+    np.savez_compressed(dst_map_file, **out)
+
+def run_capture_rectified_mode(args: argparse.Namespace) -> None:
+    """
+    使用已经生成好的 remap 映射表，实时采集左右摄像头画面，
+    并把左右 raw 图分别矫正成最终 rectified 图后保存。
+
+    这个模式和 capture 模式的区别：
+        capture 模式：
+            raw 图 -> 单目畸变矫正图
+            用于采集双目标定图片。
+
+        capture-rectified 模式：
+            raw 图 -> stereoRectify 后的最终极线校正图
+            使用的是 map_file 里的：
+                left_rect_map1 / left_rect_map2
+                right_rect_map1 / right_rect_map2
+            用于采集“已经完成双目极线校正后的左右单张图片”。
+
+    默认保存目录：
+        /home/elf/work/basketball/offline_build_stereo_rectify_maps/finish_stereo_rectify/Left
+        /home/elf/work/basketball/offline_build_stereo_rectify_maps/finish_stereo_rectify/Right
+
+    按键：
+        s：保存当前左右 rectified 图
+        q / Esc：退出
+
+    headless 模式：
+        如果没有指定 --finish-save-every 和 --finish-count，默认保存 1 组后退出，
+        避免无窗口环境下一直等待按键。
+    """
+    map_data, raw_image_size, rectified_size = load_map_file(args.map_file)
+
+    # 根据 roi_left / roi_right 或手动参数计算裁切区域。
+    # 默认 finish_crop_mode=none，不裁切；
+    # 如果想保存无黑边左右图，建议使用 --finish-crop-mode roi。
+    # 如果想同时保存一份无黑边、左右同尺寸的新 remap 表，建议使用 --finish-crop-mode common-roi。
+    left_crop, right_crop = compute_finish_crop_rects(
+        map_data,
+        raw_image_size,
+        rectified_size,
+        args,
+    )
+
+    # 输出目录可以整体用 --finish-rectify-dir 指定，
+    # 也可以分别用 --finish-left-dir / --finish-right-dir 覆盖。
+    left_dir = args.finish_left_dir or os.path.join(args.finish_rectify_dir, "Left")
+    right_dir = args.finish_right_dir or os.path.join(args.finish_rectify_dir, "Right")
+    ensure_dir(left_dir)
+    ensure_dir(right_dir)
+
+    # 如果 headless 模式没有自动保存设置，就默认只保存一组。
+    # 这样在没有 OpenCV 窗口、也没有键盘交互的情况下不会卡住。
+    if args.headless and args.finish_save_every <= 0 and args.finish_count <= 0:
+        args.finish_save_every = 1
+        args.finish_count = 1
+        print("[提示] headless 模式未指定自动保存参数，默认保存 1 组后退出。")
+
+    print("\n================ 使用 remap 采集最终校正图 ================")
+    print(f"map_file          : {args.map_file}")
+    print(f"raw_image_size    : {raw_image_size}")
+    print(f"rectified_size    : {rectified_size}")
+    print(f"left save dir     : {left_dir}")
+    print(f"right save dir    : {right_dir}")
+    print(f"save_ext          : {args.save_ext}")
+    print(f"finish_save_every : {args.finish_save_every}")
+    print(f"finish_count      : {args.finish_count}")
+    print(f"finish_crop_mode  : {args.finish_crop_mode}")
+    print(f"finish_crop_margin: {args.finish_crop_margin}")
+    print(f"left_crop         : {left_crop}")
+    print(f"right_crop        : {right_crop}")
+    print(f"left output size  : {left_crop[2]} x {left_crop[3]}")
+    print(f"right output size : {right_crop[2]} x {right_crop[3]}")
+
+    # 保存裁切参数，方便后续实时拼接或调试脚本读取。
+    crop_param_path = args.finish_crop_param or os.path.join(args.finish_rectify_dir, "finish_rectify_crop_params.npz")
+    save_finish_crop_params(
+        crop_param_path,
+        args.map_file,
+        rectified_size,
+        left_crop,
+        right_crop,
+        args.finish_crop_mode,
+        args.finish_crop_margin,
+    )
+    print(f"crop param saved  : {crop_param_path}")
+
+    # 可选：保存一份已经裁切过的新 remap 表。
+    # 只有左右使用同一个裁切区域时，才能保持左右 map 同尺寸。
+    if args.finish_cropped_map_file:
+        if tuple(left_crop) != tuple(right_crop):
+            print("[警告] 当前 left_crop 与 right_crop 不相同，不能保存标准 cropped map。")
+            print("       如需生成无黑边新映射表，请使用 --finish-crop-mode common-roi 或 manual。")
+        else:
+            save_cropped_common_map_file(map_data, args.finish_cropped_map_file, left_crop)
+            print(f"cropped map saved : {args.finish_cropped_map_file}")
+
+    # 摄像头采集尺寸必须和生成 map 时的 raw_image_size 一致。
+    # 如果命令行传入的 width/height 不一致，这里优先提醒；后面读取到帧后还会自动 resize。
+    if (args.width, args.height) != raw_image_size:
+        print("[警告] 当前 --width/--height 与 map_file 中的 raw_image_size 不一致。")
+        print(f"  args size : {(args.width, args.height)}")
+        print(f"  map size  : {raw_image_size}")
+        print("  建议采集尺寸与生成映射表时完全一致，否则 resize 会影响画质和几何精度。")
+
+    cap_left = open_usb_camera(args.left_device, args.width, args.height, args.fps, use_mjpg=not args.no_mjpg)
+    cap_right = open_usb_camera(args.right_device, args.width, args.height, args.fps, use_mjpg=not args.no_mjpg)
+
+    existing_left = sorted(
+        glob.glob(os.path.join(left_dir, "*.png"))
+        + glob.glob(os.path.join(left_dir, "*.jpg"))
+        + glob.glob(os.path.join(left_dir, "*.jpeg"))
+    )
+    save_idx = len(existing_left)
+    saved_count = 0
+    frame_idx = 0
+    fps_counter = FPSCounter()
+    resize_warned = False
+
+    def save_pair(left_rect: np.ndarray, right_rect: np.ndarray) -> None:
+        """保存一组左右最终校正后的图片。"""
+        nonlocal save_idx, saved_count
+
+        ext = args.save_ext.lower().lstrip(".")
+        if ext not in ("png", "jpg", "jpeg"):
+            ext = "png"
+
+        left_path = os.path.join(left_dir, f"left_{save_idx:06d}.{ext}")
+        right_path = os.path.join(right_dir, f"right_{save_idx:06d}.{ext}")
+
+        # 保存前裁切。
+        # 如果 finish_crop_mode=none，left_crop/right_crop 就是完整图像区域，相当于不裁切。
+        left_save = crop_by_rect(left_rect, left_crop)
+        right_save = crop_by_rect(right_rect, right_crop)
+
+        ok_l = cv2.imwrite(left_path, left_save)
+        ok_r = cv2.imwrite(right_path, right_save)
+
+        if not ok_l or not ok_r:
+            print("[错误] 图片保存失败，请检查目录权限和磁盘空间。")
+            print(f"  left_path  : {left_path}, ok={ok_l}")
+            print(f"  right_path : {right_path}, ok={ok_r}")
+            return
+
+        print(f"已保存第 {save_idx} 组最终校正图：")
+        print(f"  {left_path}")
+        print(f"  {right_path}")
+        save_idx += 1
+        saved_count += 1
+
+    print("\n开始采集左右最终 rectified 图")
+    print("按键：s 保存当前组；q / Esc 退出")
+    print("说明：保存的是 raw 图经过 stereo_rectify_maps_wide.npz 映射后的左右单张图。")
+
+    try:
+        with TerminalKeyReader() as key_reader:
+            while True:
+                # 先 grab 两个摄像头，再 retrieve，可以尽量减小左右帧时间差。
+                if not cap_left.grab():
+                    print("[警告] 左相机 grab 失败")
+                    continue
+                if not cap_right.grab():
+                    print("[警告] 右相机 grab 失败")
+                    continue
+
+                ret_l, raw_left = cap_left.retrieve()
+                ret_r, raw_right = cap_right.retrieve()
+
+                if not ret_l or raw_left is None:
+                    print("[警告] 左相机 retrieve 失败")
+                    continue
+                if not ret_r or raw_right is None:
+                    print("[警告] 右相机 retrieve 失败")
+                    continue
+
+                # map 是按 raw_image_size 生成的，所以输入 remap 之前必须保证尺寸一致。
+                if (raw_left.shape[1], raw_left.shape[0]) != raw_image_size:
+                    if not resize_warned:
+                        print("[警告] 左图尺寸与 raw_image_size 不一致，自动 resize。")
+                        resize_warned = True
+                    raw_left = cv2.resize(raw_left, raw_image_size)
+                if (raw_right.shape[1], raw_right.shape[0]) != raw_image_size:
+                    if not resize_warned:
+                        print("[警告] 右图尺寸与 raw_image_size 不一致，自动 resize。")
+                        resize_warned = True
+                    raw_right = cv2.resize(raw_right, raw_image_size)
+
+                left_rect, right_rect = rectify_pair_by_map(
+                    raw_left,
+                    raw_right,
+                    map_data,
+                    input_already_undistorted=False,
+                )
+
+                fps = fps_counter.update()
+                frame_idx += 1
+
+                should_save = False
+                cv_key = -1
+
+                if args.finish_save_every > 0 and (frame_idx % args.finish_save_every == 0):
+                    should_save = True
+
+                if not args.headless and (frame_idx % max(1, args.display_every) == 0):
+                    # 显示时也使用裁切后的图，这样预览看到的就是最终保存效果。
+                    # 为了节省资源，先裁切再缩小，最后横向拼接。
+                    preview_left = crop_by_rect(left_rect, left_crop)
+                    preview_right = crop_by_rect(right_rect, right_crop)
+                    small_left = resize_for_display(preview_left, args.display_scale)
+                    small_right = resize_for_display(preview_right, args.display_scale)
+                    ph = min(small_left.shape[0], small_right.shape[0])
+                    wide = np.hstack([small_left[:ph], small_right[:ph]])
+
+                    status = (
+                        f"CAPTURE RECTIFIED | FPS:{fps:.1f} | saved:{save_idx} | "
+                        f"s save | q quit | crop:{left_crop[2]}x{left_crop[3]} / {right_crop[2]}x{right_crop[3]}"
+                    )
+                    cv2.putText(
+                        wide,
+                        status,
+                        (20, 35),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,
+                        (0, 255, 0),
+                        2,
+                    )
+                    cv2.imshow("capture final rectified pair", wide)
+                    cv_key = cv2.waitKey(1)
+
+                key = read_key_from_cv_and_terminal(cv_key, key_reader.read_key())
+
+                if key in ("q", "Q") or cv_key == 27:
+                    print("退出最终校正图采集。")
+                    break
+
+                if key in ("s", "S"):
+                    should_save = True
+
+                if should_save:
+                    save_pair(left_rect, right_rect)
+
+                    if args.finish_count > 0 and saved_count >= args.finish_count:
+                        print(f"已达到 finish_count={args.finish_count}，退出采集。")
+                        break
+
+    finally:
+        cap_left.release()
+        cap_right.release()
+        cv2.destroyAllWindows()
+
 def make_wide_debug(left_rect: np.ndarray, right_rect: np.ndarray, epiline_step: int) -> Tuple[np.ndarray, np.ndarray]:
     h = min(left_rect.shape[0], right_rect.shape[0])
     wide = np.hstack([left_rect[:h], right_rect[:h]])
@@ -1518,9 +2131,9 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--mode",
-        choices=["capture", "build", "test-image"],
+        choices=["capture", "build", "test-image", "capture-rectified"],
         required=True,
-        help="capture=采集已单目矫正双目标定图；build=生成 remap；test-image=用图片测试 remap",
+        help="capture=采集已单目矫正双目标定图；build=生成 remap；test-image=用图片测试 remap；capture-rectified=用生成好的 remap 采集最终校正图",
     )
 
     # 摄像头参数
@@ -1546,6 +2159,77 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--capture-dir", default=DEFAULT_CAPTURE_DIR, help="双目标定图保存/读取目录")
     parser.add_argument("--map-file", default=DEFAULT_MAP_FILE, help="输出 remap npz 文件")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="调试输出目录")
+    parser.add_argument(
+        "--finish-rectify-dir",
+        default=DEFAULT_FINISH_RECTIFY_DIR,
+        help="capture-rectified 模式的输出根目录，默认会在下面创建 Left / Right",
+    )
+    parser.add_argument(
+        "--finish-left-dir",
+        default="",
+        help="capture-rectified 模式左图输出目录；为空时使用 finish-rectify-dir/Left",
+    )
+    parser.add_argument(
+        "--finish-right-dir",
+        default="",
+        help="capture-rectified 模式右图输出目录；为空时使用 finish-rectify-dir/Right",
+    )
+    parser.add_argument(
+        "--finish-save-every",
+        type=int,
+        default=0,
+        help="capture-rectified 模式自动保存间隔。0 表示只按 s 手动保存；例如 30 表示每 30 帧保存一次",
+    )
+    parser.add_argument(
+        "--finish-count",
+        type=int,
+        default=0,
+        help="capture-rectified 模式最多保存多少组。0 表示不限制；headless 下若未指定自动保存则默认保存 1 组",
+    )
+    parser.add_argument(
+        "--finish-crop-mode",
+        choices=["none", "roi", "common-roi", "bbox", "common-bbox", "manual", "manual-lr"],
+        default="none",
+        help=(
+            "capture-rectified 保存前的裁切方式。"
+            "none=不裁切；roi=左右分别用 roi_left/roi_right，保留各自无黑边有效画面；"
+            "common-roi=左右使用 roi 交集，尺寸一致且无黑边；"
+            "bbox/common-bbox=根据 remap mask 外接矩形估计；manual=使用 --finish-manual-crop"
+        ),
+    )
+    parser.add_argument(
+        "--finish-crop-margin",
+        type=int,
+        default=0,
+        help="在有效裁切区域基础上向内缩小的像素数，用于去掉边缘残留黑线，例如 2 或 4",
+    )
+    parser.add_argument(
+        "--finish-manual-crop",
+        default="",
+        help="手动裁切区域，格式 x,y,w,h。仅在 --finish-crop-mode manual 时使用，例如 913,588,611,508",
+    )
+    parser.add_argument(
+        "--finish-left-manual-crop",
+        default="",
+        help="左图手动裁切区域，格式 x,y,w,h。仅在 --finish-crop-mode manual-lr 时使用，例如 850,360,1320,820",
+    )
+
+    parser.add_argument(
+        "--finish-right-manual-crop",
+        default="",
+        help="右图手动裁切区域，格式 x,y,w,h。仅在 --finish-crop-mode manual-lr 时使用，例如 330,420,1450,760",
+    )
+    
+    parser.add_argument(
+        "--finish-crop-param",
+        default="",
+        help="裁切参数保存路径。为空时默认保存到 finish-rectify-dir/finish_rectify_crop_params.npz",
+    )
+    parser.add_argument(
+        "--finish-cropped-map-file",
+        default="",
+        help="可选：保存一份已经裁切过的新 remap npz。要求左右使用同一裁切区域，建议配合 common-roi/manual 使用",
+    )
     parser.add_argument("--left-image", default="", help="test-image 模式左图")
     parser.add_argument("--right-image", default="", help="test-image 模式右图")
     parser.add_argument(
@@ -1601,6 +2285,16 @@ def parse_args() -> argparse.Namespace:
     # 用户传 --zero-disparity 时再强制使用。
     args.no_zero_disparity = not args.zero_disparity
 
+    if args.finish_crop_mode == "manual" and not args.finish_manual_crop:
+        raise RuntimeError("使用 --finish-crop-mode manual 时必须指定 --finish-manual-crop x,y,w,h")
+
+    if args.finish_crop_mode == "manual-lr":
+        if not args.finish_left_manual_crop or not args.finish_right_manual_crop:
+            raise RuntimeError(
+                "使用 --finish-crop-mode manual-lr 时必须同时指定 "
+                "--finish-left-manual-crop 和 --finish-right-manual-crop"
+            )
+
     return args
 
 
@@ -1639,6 +2333,8 @@ def main() -> None:
         if not args.left_image or not args.right_image:
             raise RuntimeError("test-image 模式必须指定 --left-image 和 --right-image")
         run_test_image_mode(args)
+    elif args.mode == "capture-rectified":
+        run_capture_rectified_mode(args)
 
 
 if __name__ == "__main__":

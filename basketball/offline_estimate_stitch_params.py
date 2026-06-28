@@ -34,25 +34,11 @@ offline_estimate_stitch_params.py
        如果你输入的是摄像头 raw 原图，就不要加这个参数。
 
 典型用法：
-    python3 offline_estimate_stitch_params.py \
-        --map-file /home/elf/work/basketball/offline_build_stereo_rectify_maps/stereo_rectify_maps_wide.npz \
-        --left-image /home/elf/work/basketball/stereo_rectify_live_debug/live_000000_left_rect.jpg \
-        --right-image /home/elf/work/basketball/stereo_rectify_live_debug/live_000000_right_rect.jpg \
-        --output-param /home/elf/work/basketball/offline_build_stereo_rectify_maps/stitch_params.npz \
-        --output-dir /home/elf/work/basketball/offline_build_stereo_rectify_maps/stitch_param_debug \
-        --input-already-undistorted \
-        --min-overlap 700 \
-        --max-overlap 1200 \
-        --max-vertical-offset 120 \
-        --search-scale 0.35
-
-
-
-
+//传入双极线矫正后图做融合
     python3 offline_estimate_stitch_params.py \
     --map-file /home/elf/work/basketball/offline_build_stereo_rectify_maps/stereo_rectify_maps_wide.npz \
-    --left-image /home/elf/work/basketball/stereo_rectify_live_debug/live_000000_left_rect.jpg \
-    --right-image /home/elf/work/basketball/stereo_rectify_live_debug/live_000000_right_rect.jpg \
+    --left-image  /home/elf/work/basketball/offline_build_stereo_rectify_maps/finish_stereo_rectify/Left/left_000006.png \
+    --right-image /home/elf/work/basketball/offline_build_stereo_rectify_maps/finish_stereo_rectify/Right/right_000006.png \
     --output-param /home/elf/work/basketball/offline_build_stereo_rectify_maps/stitch_params.npz \
     --output-dir /home/elf/work/basketball/offline_build_stereo_rectify_maps/stitch_param_debug \
     --input-already-rectified \
@@ -60,6 +46,24 @@ offline_estimate_stitch_params.py
     --max-overlap 1200 \
     --max-vertical-offset 100 \
     --search-scale 0.35
+
+//传入原始图做融合
+    python3 offline_estimate_stitch_params.py \
+        --map-file /home/elf/work/basketball/offline_build_stereo_rectify_maps/stereo_rectify_maps_wide.npz \
+        --left-image /home/elf/work/basketball/offline_build_stereo_rectify_maps/finish_stereo_rectify/Left/left_000004.png \
+        --right-image /home/elf/work/basketball/offline_build_stereo_rectify_maps/finish_stereo_rectify/Right/right_000004.png \
+        --output-param /home/elf/work/basketball/offline_build_stereo_rectify_maps/stitch_params.npz \
+        --output-dir /home/elf/work/basketball/offline_build_stereo_rectify_maps/stitch_param_debug \
+        --input-already-undistorted \
+        --min-overlap 700 \
+        --max-overlap 1200 \
+        --max-vertical-offset 100 \
+        --search-scale 0.35
+
+
+
+
+
         
 """
 

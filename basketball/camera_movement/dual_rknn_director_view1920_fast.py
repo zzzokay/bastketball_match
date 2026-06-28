@@ -46,8 +46,8 @@ python3 dual_rknn_director_view1920_fast.py \
     --right-device /dev/video43 \
     --model /home/elf/work/basketball/model/basketball_player_fp_2.1.0.rknn \
     --labels /home/elf/work/basketball/model/labels.txt \
-    --map-file /home/elf/work/basketball/offline_build_stereo_rectify_maps/stereo_rectify_maps_wide_good.npz \
-    --stitch-param /home/elf/work/basketball/offline_build_stereo_rectify_maps/stitch_params_good.npz \
+    --map-file /home/elf/work/basketball/offline_build_stereo_rectify_maps/stereo_rectify_maps_wide.npz \
+    --stitch-param /home/elf/work/basketball/offline_build_stereo_rectify_maps/stitch_params.npz \
     --width 1920 \
     --height 1080 \
     --fps 30 \
@@ -57,7 +57,7 @@ python3 dual_rknn_director_view1920_fast.py \
     --runtime-seam-x 150 \
     --runtime-blend-width 40 \
     --runtime-right-x-shift 30 \
-    --runtime-right-y-shift -5 \
+    --runtime-right-y-shift 0 \
     --detect-interval 3 \
     --smooth 0.70 \
     --view-width 1920 \
@@ -935,6 +935,7 @@ def run(args: argparse.Namespace) -> None:
     window_name = "RKNN director view 1920x1080"
     if not args.headless:
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
     frame_idx = 0
     debug_idx = 0

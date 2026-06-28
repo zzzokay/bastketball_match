@@ -29,15 +29,15 @@ RK3588 / ELF2 多路视频录制脚本。
     python3 record_select_h264_rkmpp_video.py \
         --left-device /dev/video41 \
         --right-device /dev/video43 \
-        --map-file /home/elf/work/basketball/offline_build_stereo_rectify_maps/stereo_rectify_maps_wide_good.npz \
-        --stitch-param /home/elf/work/basketball/offline_build_stereo_rectify_maps/stitch_params_good.npz \
+        --map-file /home/elf/work/basketball/offline_build_stereo_rectify_maps/stereo_rectify_maps_wide.npz \
+        --stitch-param /home/elf/work/basketball/offline_build_stereo_rectify_maps/stitch_params.npz \
         --save-root /home/elf/work/basketball/h264_recordings \
         --width 1920 --height 1080 --fps 30 \
-        --view-fps 20 --wide-fps 5 --left-fps 20 --right-fps 20 \
+        --view-fps 20 --wide-fps 15 --left-fps 20 --right-fps 20 \
         --runtime-seam-x 150 \
         --runtime-blend-width 40 \
         --runtime-right-x-shift 30 \
-        --runtime-right-y-shift -5 \
+        --runtime-right-y-shift 0 \
         --display-scale 0.25
 
 重要建议：
